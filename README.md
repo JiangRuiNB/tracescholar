@@ -802,5 +802,5 @@ Out of scope for v0.1:
 
 ## License
 
-The package metadata declares Apache-2.0. The repository does not yet include
-the license text file; confirm the license terms before redistribution.
+TraceScholar is licensed under the Apache License, Version 2.0. See
+[LICENSE](LICENSE) for the complete license text.
