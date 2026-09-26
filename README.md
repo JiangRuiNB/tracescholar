@@ -1,16 +1,54 @@
 # TraceScholar
 
-TraceScholar is an evidence-first scientific literature research agent. The
-project currently provides a runnable Python package, a PostgreSQL/pgvector
-foundation, durable research runs, a typed Scope Planner, automatic
-OpenAlex/Crossref discovery from frozen plans, title/abstract screening,
-and legal open-access PDF acquisition.
+**Version: 0.1.0**
+
+TraceScholar is an evidence-first research assistant that turns a research
+question into a reproducible, citation-grounded literature review draft. A
+run records its plan, searches, screening decisions, paper versions, evidence,
+draft, audits, and export so readers can trace factual sentences back to
+quoted text and PDF pages.
+
+## What v0.1 does
+
+- Searches OpenAlex and Crossref, merges duplicate paper records, and keeps
+  source-level search provenance.
+- Screens papers in two stages: title/abstract, then relevant full-text chunks.
+- Retrieves verified open-access PDFs when available; it does not bypass
+  paywalls or login restrictions.
+- Parses text into page-aware, section-aware chunks and stores cloud-generated
+  embeddings in PostgreSQL with pgvector for run-scoped retrieval.
+- Groups preprint and published records into canonical Studies without
+  deleting the original records or PDF versions.
+- Builds a Claim / Evidence Ledger with verbatim quotes, stances, and page
+  locations.
+- Writes a structured Grounded Review and exports deterministic Markdown and
+  JSON.
+- Runs deterministic citation-chain, semantic citation, and omitted-evidence
+  audits, and records a Run Manifest.
+- Supports a synchronous, resumable workflow that stops on completion, failure,
+  or a blocked prerequisite.
+
+## Limits and human review
+
+- OCR is not implemented. Image-only PDFs without extractable text cannot be
+  parsed.
+- TraceScholar never bypasses paywalls, logins, or other access controls, and
+  cannot guarantee that every candidate paper has an obtainable full text.
+- Semantic Audit can return `revise` or `reject`. A suggested revision is not
+  silently applied; review the original wording and recommendation yourself.
+- TraceScholar is not a replacement for a systematic review or meta-analysis.
+  Search coverage, provider metadata, model judgments, and extracted evidence
+  can be incomplete or wrong and require researcher review.
+- An open-access location permits retrieval under the locator's checks; it does
+  not by itself grant permission to redistribute the PDF.
 
 ## Requirements
 
 - Python 3.12 or newer
+- Docker with Docker Compose, for the included PostgreSQL 16 + pgvector service
+- Network access and credentials for the configured LLM and embedding services
 
-## Run locally
+## Installation
 
 Create and activate a virtual environment:
 
@@ -50,9 +88,13 @@ Configuration can be provided through `.env` or environment variables. All
 variables use the `TRACESCHOLAR_` prefix, and environment variables take
 precedence over values from `.env`.
 
-The current configuration covers the database, an OpenAI-compatible LLM,
-OpenAlex, and Crossref. Secret values use Pydantic's secret type so they are masked in logs
-and object representations.
+Set at least `TRACESCHOLAR_LLM_BASE_URL`, `TRACESCHOLAR_LLM_API_KEY`, and
+`TRACESCHOLAR_LLM_MODEL` for an OpenAI-compatible Chat Completions service.
+Embedding uses a separate compatible service and key; the example defaults to
+Alibaba Cloud's `qwen3.7-text-embedding` at 1024 dimensions. OpenAlex API key
+and Crossref email are optional. Never commit `.env` or put real credentials
+in `.env.example`. Configuration is centralized in `Settings`, and secret
+values are masked in logs and object representations.
 
 ## Database
 
@@ -71,15 +113,8 @@ Apply all migrations:
 alembic upgrade head
 ```
 
-The initial migration enables the `vector` extension and creates the
-`research_runs` table. The second migration adds `search_queries`, `papers`,
-and the `search_results` link table. The third migration gives each source hit
-its own ID so distinct provider records can point to one paper. The fourth adds
-one frozen `research_plans` record per run. The fifth adds generated-query
-provenance, execution links and counts, and paper language. The sixth adds
-auditable title/abstract screening decisions. The seventh creates
-`paper_versions` and `fulltext_acquisitions` for content-addressed PDF storage
-and per-run outcomes. Future schema changes must use Alembic migrations.
+This applies the complete migration chain, including the pgvector extension
+and all current tables. Schema changes are managed through Alembic migrations.
 
 Create a research run:
 
@@ -92,8 +127,39 @@ tracescholar research \
 Example output:
 
 ```text
-Created ResearchRun 00db5bbd-de15-4624-b138-ce37d9a6d02a [pending]
+Created ResearchRun <RUN_ID> [pending]
 ```
+
+Copy the generated ID and run the complete workflow:
+
+```bash
+tracescholar run <RUN_ID>
+tracescholar workflow-status <RUN_ID>
+```
+
+`run` advances stages in order and stops when the run is `completed`, a stage
+`failed`, or a prerequisite is `blocked`. Rerun the same command to resume from
+the unfinished stage; completed stages are not needlessly repeated.
+This workflow makes requests to the configured paper sources, LLM, and
+embedding service as needed, and may consume their quotas or incur usage costs.
+
+After the workflow creates a manifest, `manifest` prints its ID and content
+hash, while `show-manifest` reads and validates that saved snapshot:
+
+```bash
+tracescholar manifest <RUN_ID>
+tracescholar show-manifest <MANIFEST_ID>
+```
+
+Export the saved draft and audit state without rerunning research or calling an
+LLM:
+
+```bash
+tracescholar export <RUN_ID> --output-dir ./review-export
+```
+
+This writes `report.md` and `report.json` under `./review-export`. By default,
+exports go to `data/exports/<RUN_ID>/`, which is excluded from Git.
 
 ## Scope Planner
 
@@ -166,12 +232,9 @@ language query filter, so results with absent or mismatched language metadata
 are excluded when the frozen scope specifies a language. Unsupported scope keys
 cause a clear error before any request rather than being silently ignored.
 
-For example, an existing RAG run with `year_from=2023` and `languages=["en"]`
-produced 8 queries across 4 tracks. With `--limit 5`, OpenAlex and Crossref
-each returned 40 raw hits; 36 hits failed the frozen scope, and the remaining
-44 source hits linked to 32 unique papers. A repeat run executed 0 searches
-and skipped all 16 saved query/source pairs. Provider rankings and counts will
-change over time.
+Search and paper counts depend on provider data, the frozen scope, and the
+selected limit. Successful query/source pairs are reused on repeat runs;
+unsuccessful pairs can be retried.
 
 ## Manual discovery data
 
@@ -233,9 +296,8 @@ providers' results in an existing run:
 tracescholar search <RESEARCH_RUN_UUID> "retrieval augmented generation" --limit 20
 ```
 
-For example, a real `Attention Is All You Need` search returned 20 hits from
-each provider: 40 raw hits became 38 unique papers, with 2 cross-source
-duplicates merged. The exact counts depend on current provider rankings.
+Provider result counts and rankings change over time. The command reports the
+actual counts for each execution rather than assuming fixed search results.
 
 The command reports returned and persisted hits per provider, total raw hits,
 unique papers, and merged duplicates. Each provider gets a separate
@@ -302,10 +364,8 @@ screening result and can be retried by running the same command again. The
 stored matched criteria are the exact frozen-plan strings, not free-form
 criteria invented by the model.
 
-In the existing 32-paper RAG example, live title/abstract screening saved
-7 `include`, 17 `maybe`, and 8 `exclude` decisions. The immediate repeat run
-reported 0 newly screened and 32 skipped unchanged. These are provisional
-screening judgments, not verified findings or full-text eligibility decisions.
+These are provisional screening judgments, not verified findings or full-text
+eligibility decisions. Unchanged successful decisions are skipped on reruns.
 
 ## Open-access PDF acquisition
 
@@ -340,11 +400,8 @@ screen full text, create chunks, embeddings, claims, or evidence spans.
 OpenAlex documents its [OA location evidence](https://help.openalex.org/data/works/open-access/)
 and [full-text endpoint and copyright boundary](https://help.openalex.org/access/fulltext/).
 
-In the existing RAG run, all 24 `include`/`maybe` candidates had an OA PDF
-available and were downloaded. The next invocation downloaded 0 files and
-reported 24 cached successes. Each saved file's SHA-256 matched its
-`PaperVersion` record. These counts are a snapshot of that run, not a guarantee
-for other topics or future source availability.
+OA availability varies by paper and source. Every result is recorded per run;
+valid cached files are reused instead of downloaded again.
 
 ## Page-aware PDF parsing
 
@@ -364,7 +421,7 @@ SHA-256 before reading it, extracts text in page order (including common
 two-column layouts), omits repeated page margins and the references section,
 and groups adjacent lines by section and paragraph before length-bounding
 chunks. This is text extraction, not OCR: image-only PDFs are recorded as
-`no_text` failures and can be retried after adding an OCR stage later.
+`no_text` failures. This version does not include an OCR stage.
 
 `ParsedPage` retains the normalized text of every physical page, including
 empty pages. `Chunk` links to one immutable `PaperVersion` and stores a section,
@@ -382,12 +439,8 @@ version; failed versions are retried next time. Layout heuristics are
 best-effort: complex tables, equations, and unusual typography may still need
 manual review before downstream evidence extraction.
 
-For the existing RAG run (`5d4103df-4737-4132-8dd0-002a536ecd89`), all 24
-acquired versions parsed successfully: 628 physical pages and 5,460 chunks.
-All stored chunks were checked to match their exact `ParsedPage.text` offsets
-and to have in-page bounding boxes. A repeat parse created 0 new chunks and
-skipped all 24 versions. Three sampled bounding boxes were also checked
-against rendered source PDF pages.
+Successful unchanged versions are skipped on reruns. Parser quality flags and
+failure reasons remain attached to each version for inspection.
 
 ## Cloud embeddings and run-scoped retrieval
 
@@ -430,12 +483,8 @@ database performs exact top-k vector search rather than approximate indexing,
 so filtering by run does not discard candidates. This stage does not perform
 reranking, claim extraction, or report generation.
 
-Step 12 acceptance on the existing RAG run
-`5d4103df-4737-4132-8dd0-002a536ecd89`: all 5,460 chunks from 24 PDF
-versions were embedded with the cloud model (0 failures). Repeating `embed`
-generated 0 new vectors and skipped all 5,460 unchanged chunks. The example
-query above returned 10 run-scoped chunks; sampled hits were checked against
-their original PDF pages and character/bounding-box locators.
+Embedding and retrieval are scoped to the requested run. Unchanged successful
+embeddings are reused; failed chunks can be retried independently.
 
 ## Full-text screening and evidence retrieval
 
@@ -468,19 +517,6 @@ title/abstract screening timeout is unchanged.
 This step finds candidate evidence only. It does not create `EvidenceSpan` or
 `Claim` records, analyze conflicts, or write a review.
 
-Step 13 acceptance on the existing RAG run
-`5d4103df-4737-4132-8dd0-002a536ecd89`: 24 candidate PDFs were screened;
-11 Paper records were included, 0 excluded, and 13 left uncertain under the
-frozen strict scope. There were no failures or pending papers. The 11 included
-records comprise 10 labeled primary empirical evidence and one review/background
-record. The existing Discovery data contains a known preprint/published-version
-near-duplicate among the included records, so these counts are not a count of
-distinct studies. All 120 saved
-Chunk citations point to the same PDF version as their screening decision;
-their page and character offsets match the stored parsed-page text. The one
-`low_page_coverage` warning remains attached to an uncertain decision. A second
-invocation produced 0 new screenings and skipped all 24 unchanged papers.
-
 ## Canonical studies and publication versions
 
 `Paper` remains a bibliographic/source record and `PaperVersion` remains an
@@ -500,7 +536,7 @@ tracescholar studies <RESEARCH_RUN_UUID>
 tracescholar study <RESEARCH_RUN_UUID> <STUDY_UUID>
 ```
 
-The per-run `StudyRunSelection` picks one default PDF for future evidence
+The per-run `StudyRunSelection` picks one default PDF for Claim/Evidence
 extraction: a well-parsed published version is preferred; a usable preprint
 can take precedence over a damaged or incomplete published PDF. The choice
 stores a policy and input fingerprint, so reruns reuse unchanged decisions.
@@ -516,18 +552,8 @@ tracescholar study-compare <RUN_UUID> <STUDY_UUID> <PDF_A_UUID> <PDF_B_UUID> \
 ```
 
 A `changed` comparison causes the extraction-version plan to retain both PDFs
-for separate future extraction, while the independent-study count remains one.
+for separate evidence extraction, while the independent-study count remains one.
 This stage does not create claims, evidence spans, conflict analyses or reports.
-
-Step 14 acceptance on the existing RAG run
-`5d4103df-4737-4132-8dd0-002a536ecd89`: 24 Paper records and 24 PDFs
-resolve into 22 independent studies. Two strong preprint/published-version
-groups contain four records (two surplus records for study-level counting),
-with no unresolved bibliographic candidates. The two pairs of different PDFs
-have not been assessed for changes in experimental results. The default PDFs
-for both linked studies are the EMNLP/NAACL published versions. A second run
-creates no new memberships or comparisons. The 11 `include` Paper records
-represent 10 studies; the 13 `uncertain` records represent 12 studies.
 
 ## Evidence Ledger
 
@@ -562,8 +588,8 @@ An insufficient passage produces a durable `no_evidence` result, not an
 invented quote; malformed model output becomes a retryable per-study failure.
 Different benchmark lists or a paper's silence on a method are not treated as
 contradictions. Cross-study `contradicts` labels require an explicit opposing
-result in the quote; this conservative guard may miss implicit contradictions,
-which are left for later audit rather than counted falsely.
+result in the quote; this conservative guard may miss implicit contradictions.
+The Evidence Ledger is an auditable record, not a complete conflict analysis.
 Input fingerprints skip successful unchanged work, while preserving prior
 attempts when a PDF, retrieval model, or prompt changes. The Evidence stage
 uses `TRACESCHOLAR_EVIDENCE_LLM_TIMEOUT_SECONDS` independently of other LLM
@@ -580,19 +606,6 @@ eligible PDFs is `no_evidence` only if **both** completed without evidence;
 different stances from one Study may overlap, so stance-study counts must not
 be summed as independent studies. Aggregation only reads persisted rows: it
 does not call an LLM, perform retrieval, or write a review.
-
-Step 15 acceptance on the existing RAG run
-`5d4103df-4737-4132-8dd0-002a536ecd89`: 10 final-included independent
-studies yielded 2 quote-grounded candidate Claims and 20 Claim × Study
-extraction tasks. The current prompt version produced 9 page-verified
-EvidenceSpans: 3 `supports`, 0 `contradicts`, and 6 `qualifies`. Thirteen
-tasks explicitly recorded `no_evidence`; none failed. Those 9 spans come
-from 5 distinct Studies, not 9 independent studies. On a repeat run,
-all 20 unchanged tasks were skipped and no new spans were created. A zero
-`contradicts` count is not a finding of consensus: these limited candidate
-claims were not directly refuted by the retrieved passages. Earlier prompt
-attempts remain in the database for audit but are excluded from the default
-current-version ledger.
 
 The Evidence Ledger stage does not build a Claim Graph, classify conflicts,
 write a review, audit citations, or produce a gap report.
@@ -703,14 +716,15 @@ normalized title and year. The `(normalized_title, year)` index accelerates
 that lookup but is not unique: different papers can share a title. Conflicting
 identifiers raise `PaperIdentityConflict` instead of silently merging records.
 
-## Resumable workflow skeleton
+## Resumable workflow
 
 The workflow service reads saved stage outputs and reports the first unfinished
 stage. It records each single-stage attempt, start/finish times, duration, and
 failure reason. A failed stage stays the next stage to retry; earlier research
 records are left intact. Stages are dispatched through their existing services.
 
-This is deliberately a one-step controller, not an all-in-one pipeline runner:
+Use `workflow-step` to advance one stage for inspection, or `run` to continue
+through all remaining stages synchronously:
 
 ```bash
 alembic upgrade head
@@ -739,20 +753,20 @@ docker compose stop postgres
 
 ## Run tests
 
-The initial test suite uses Python's standard library and requires no extra
+The test suite uses Python's standard library and requires no extra
 testing dependencies:
 
 ```bash
 python -m unittest discover -s tests
 ```
 
-## Current scope
+## v0.1 implemented scope
 
 Included:
 
 - `src`-layout Python package
 - installable `tracescholar` command
-- minimal smoke test
+- automated tests for the CLI and research stages
 - centralized environment and `.env` configuration
 - PostgreSQL 16 with pgvector through Docker Compose
 - SQLAlchemy session and transaction management
@@ -777,13 +791,16 @@ Included:
 - per-sentence deterministic, semantic, and omitted-evidence audit persistence
 - versioned, content-addressed RunManifest snapshots of persisted run facts
 - deterministic Grounded Review Markdown and JSON export with audit-state annotations
-- one-stage-at-a-time workflow status, order checks, and persisted retry history
+- synchronous resumable workflow, one-stage controls, order checks, and persisted retry history
 
-Not included yet:
+Out of scope for v0.1:
 
-- OCR, reranking, Claim Graph, conflict analysis, gap report, BibTeX/CSV, and packaged report bundles
-- other academic data sources beyond OpenAlex and Crossref
+- OCR, reranking, Claim Graph, complex conflict analysis, and gap reports
+- systematic-review protocol management or meta-analysis
+- BibTeX/CSV export, a web UI, and an HTTP API
+- academic paper sources beyond OpenAlex and Crossref
 
 ## License
 
-Apache-2.0. A `LICENSE` file will be added before the first public release.
+The package metadata declares Apache-2.0. The repository does not yet include
+the license text file; confirm the license terms before redistribution.
